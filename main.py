@@ -8,7 +8,6 @@ import pandas as pd
 
 from telethon import TelegramClient, errors, functions, types
 
-logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.WARNING)
 channels_list = [
     "https://t.me/joinchat/RYlASrK1ZBj3CJVr",
     "https://t.me/smmbunker",
@@ -332,12 +331,22 @@ async def search_text(client: TelegramClient, channels_list: list, keywords: Lis
         try:
             channel_entity = await client.get_entity(channel)
         except ValueError as e:
-            print(f"For link {channel}\nGot error: {e}")
+            logging.error(f"Creating entity for {channel} caused an error: {e}")
             continue
+        logging.info(f"Processing channel with username: {channel_entity.username}")
+        input_channel_info = channel if channel_entity.username else channel_entity.id
+        input_channel_name = channel_entity.title if not channel_entity.username else channel_entity.username
+        logging.info(f"Retrieving input entity by data: {input_channel_info}")
 
         for keyword in keywords:
+            try:
+                input_entity = await client.get_input_entity(input_channel_info)
+            except errors.FloodWaitError as e:
+                logging.warning(f"FloodWaitError when parsing entity. Have to sleep {e.seconds} seconds")
+                time.sleep(e.seconds)
+
             result = await client(functions.messages.SearchRequest(
-                peer=await client.get_input_entity(channel),
+                peer=input_entity,
                 q=keyword,
                 min_date=threshold_date,
                 max_date=datetime.now(),
@@ -350,55 +359,40 @@ async def search_text(client: TelegramClient, channels_list: list, keywords: Lis
                 hash=0
             ))
             for message in result.messages:
-                if not message.message:
-                    print(f"Skipping due to missing message")
+                # Verify if found message is unique among all stored messages
+                duplicated_message = any(viewed_message[-1] == message.message for viewed_message in message_data)
+                if duplicated_message:
+                    logging.debug(f"Skipped message with duplicated content {message.id}")
                     continue
                 try:
                     sender = (await client.get_entity(message.from_id.user_id)).username
                 except AttributeError as e:
-                    print(f"Got error {e}!\nChat = {channel_entity.username} Key = {keyword} Date = {message.date}")
-                    sender = ''
+                    logging.warning(f"Retrieving of sender caused an error {e}. "
+                                    f"Chat = {input_channel_name} Key = {keyword} Date = {message.date}")
+                    sender = None
 
-                print(f"Chat = {channel_entity.username}, Key = {keyword}, Date = {message.date} Sender = {sender}")
+                logging.info(f"Appending message from the chat: {input_channel_name} found by key: {keyword} "
+                             f"with id {message.id}, date {message.date} and sender {sender}")
                 message_data.append(
-                    [message.id, channel_entity.username, keyword, sender, message.date, message.message]
+                    [message.id, input_channel_name, keyword, sender, message.date, message.message]
                 )
-
-            # TODO: Delete this commented block after verifiction of unique found message will be done
-            # async for message in client.iter_messages(entity=channel_entity, offset_date=threshold_date, reverse=True, search=keyword):
-            #     print(f"There is a message with date {message.date}")
-            #     try:
-            #         await client.send_message(
-            #             entity=output_entity, message=f"{message.message}\n\nКонтакт: @{(await message.get_sender()).username}"
-            #         )
-            #         try:
-            #             sender = (await message.get_sender()).username
-            #         except AttributeError:
-            #             print(f"Message = {message}")
-            #             sender = ''
-            #         message_data.append([message.id, channel_entity.username, keyword, message.date, message.message, sender])
-            #
-            #     except errors.FloodWaitError as e:
-            #         count = 0
-            #         print('Have to sleep', e.seconds, 'seconds')
-            #         time.sleep(e.seconds)
+                if not sender:
+                    await client.forward_messages(output_entity, message)
+                else:
+                    await client.send_message(
+                        entity=output_entity, message=f"{message.message}\n\nКонтакт @{sender}"
+                    )
+                time.sleep(20)
 
     df = pd.DataFrame(message_data, columns=['ID', 'Channel name', 'Keyword', 'Contact', 'Date', 'Text'])
     df['Date'] = df['Date'].apply(lambda a: pd.to_datetime(a).date())
-    df.to_excel("data.xlsx")
-    with open("data.xlsx", 'rb') as file:
+    df.to_excel("results/data.xlsx")
+    with open("results/data.xlsx", 'rb') as file:
         await client.send_file(output_entity, file)
-    await client.send_message(output_entity, f"Overall time to collect all data in excel = {time.time()-start_time} seconds")
-    for row in df.itertuples():
-        try:
-            await client.send_message(
-                entity=output_entity, message=f"{row.Text} \n\nКонтакт @{row.Contact}"
-            )
-            time.sleep(30)
 
-        except errors.FloodWaitError as e:
-            print('During sending messages from xlsx file have to sleep', e.seconds, 'seconds')
-            time.sleep(e.seconds)
+    await client.send_message(
+        output_entity, f"Overall time to collect all data in excel = {time.time()-start_time} seconds"
+    )
 
 
 # Reading Configs
@@ -409,6 +403,12 @@ config.read("config/config.ini")
 api_id = int(config['Telegram']['api_id'])
 api_hash = str(config['Telegram']['api_hash'])
 username = config['Telegram']['username']
+
+logging.basicConfig(
+    format='%(asctime)s %(levelname)s - %(name)s: %(filename)s: %(message)s',
+    filename="results/logs.txt",
+    level=logging.INFO
+)
 
 # Create the client and connect
 client = TelegramClient(username, api_id, api_hash)
